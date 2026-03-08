@@ -18,6 +18,8 @@ speakers.json
 ref_audios
 tools/AP_BWE_main/24kto48k/*
 !tools/AP_BWE_main/24kto48k/readme.txt
+inputs
+.claude
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
