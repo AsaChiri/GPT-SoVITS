@@ -312,7 +312,9 @@ Requires `--ref_audio_path`. All lines use the same reference audio. No emotion 
 
 Auto mode only. Runs emotion scoring and reference selection, then writes updated `.list` files (one per input file) to `--output_dir` with the chosen ref audio path appended as the 5th column. Skips TTS pipeline loading and inference entirely.
 
-The output files are directly usable as `--input_list` for a subsequent run — entries with the 5th column will use that ref audio without re-scoring.
+Use `--dry_run_topk K` to include the top-K reference candidates in column 5 (comma-separated, best match first). This lets you review alternatives and manually swap in a different reference. Default is 5.
+
+The output files are directly usable as `--input_list` for a subsequent run — when column 5 contains comma-separated paths, only the first path is used as the ref audio.
 
 ## .list File Format
 
@@ -328,9 +330,9 @@ column1|column2|column3|column4[|column5]
 | 2 | Speaker name (matched against `speaker_config`) | Speaker name |
 | 3 | Language code (`ja`, `en`, `zh`, `ko`, `all_ja`, etc.) | Language code |
 | 4 | Text to synthesize | Transcript of the reference audio |
-| 5 (optional) | Path to reference audio override | — |
+| 5 (optional) | Path to reference audio override (comma-separated if top-K) | — |
 
-When column 5 is present in an input list, that ref audio is used directly. The script looks up the matching entry in the speaker's ref dataset (by path or basename) to retrieve the transcript and language for the TTS prompt. If no match is found, prompt text is empty and prompt language falls back to the entry's language.
+When column 5 is present in an input list, that ref audio is used directly. If it contains comma-separated paths (from `--dry_run_topk`), only the first path is used; you can reorder or remove entries to pick a different reference. The script looks up the matching entry in the speaker's ref dataset (by path or basename) to retrieve the transcript and language for the TTS prompt. If no match is found, prompt text is empty and prompt language falls back to the entry's language.
 
 ## Emotion Analysis
 
@@ -394,6 +396,7 @@ The first column of the input list is used as the output path. If not absolute, 
 | `--ref_text` | str | `""` | no | Reference audio transcript (manual mode). |
 | `--ref_lang` | str | `ja` | no | Reference audio language (manual mode). |
 | `--dry_run` | flag | `False` | no | Skip inference; write updated .list files with chosen ref_audio. |
+| `--dry_run_topk` | int | `5` | no | Number of top reference candidates in dry run output (comma-separated in column 5). |
 | `--tts_config` | str | `GPT_SoVITS/configs/tts_infer.yaml` | no | TTS config YAML path. |
 | `--gpt_path` | str | `None` | no | Override GPT model path (manual mode, or overrides speaker_config). |
 | `--sovits_path` | str | `None` | no | Override SoVITS model path. |

@@ -15,7 +15,7 @@ runtime\python.exe -I batch_inference.py ^
   --output_dir output/ ^
   --speaker_config inputs/speaker_config.yaml ^
   --output_sr 44100 ^
-  --output_channels 2
+  --output_channels 2 
 
 echo.
 echo ============================================================

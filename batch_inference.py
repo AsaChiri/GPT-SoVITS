@@ -85,7 +85,7 @@ def parse_list_file(path: str, base_dir: str = None):
                 "speaker": parts[1],
                 "language": parts[2].strip().lower(),
                 "text": parts[3],
-                "ref_audio": parts[4].strip() if len(parts) > 4 and parts[4].strip() else None,
+                "ref_audio": parts[4].split(",")[0].strip() if len(parts) > 4 and parts[4].strip() else None,
             }
             entries.append(entry)
     return entries
@@ -302,17 +302,21 @@ class ReferenceDatasetManager:
                 return entry
         return None
 
-    def find_best_reference(self, input_scores: np.ndarray) -> dict:
-        """Find the ref with highest cosine similarity to input_scores."""
+    def find_topk_references(self, input_scores: np.ndarray, k: int = 1) -> list:
+        """Find the top-k refs with highest cosine similarity to input_scores."""
         if self.score_vectors is None:
             raise RuntimeError("Call extract_emotions() first")
 
-        # Cosine similarity
         input_norm = input_scores / (np.linalg.norm(input_scores) + 1e-8)
         ref_norms = self.score_vectors / (np.linalg.norm(self.score_vectors, axis=1, keepdims=True) + 1e-8)
         similarities = ref_norms @ input_norm
-        best_idx = int(np.argmax(similarities))
-        return self.ref_entries[best_idx]
+        k = min(k, len(self.ref_entries))
+        top_indices = np.argsort(similarities)[::-1][:k]
+        return [self.ref_entries[int(idx)] for idx in top_indices]
+
+    def find_best_reference(self, input_scores: np.ndarray) -> dict:
+        """Find the ref with highest cosine similarity to input_scores."""
+        return self.find_topk_references(input_scores, k=1)[0]
 
     def unload(self):
         self.score_vectors = None
@@ -364,6 +368,8 @@ Example speaker_config.yaml:
     # Dry run — score emotions and pick refs, then write updated list file and exit
     parser.add_argument("--dry_run", action="store_true",
                         help="Skip inference; write updated .list with chosen ref_audio in 5th column")
+    parser.add_argument("--dry_run_topk", type=int, default=5,
+                        help="Number of top reference candidates to include in dry run output (comma-separated in column 5)")
 
     # TTS config
     parser.add_argument("--tts_config", default="GPT_SoVITS/configs/tts_infer.yaml", help="TTS config YAML")
@@ -609,7 +615,7 @@ def main():
         texts_to_score = []
         score_indices = []
         for i, entry in enumerate(entries):
-            if entry.get("ref_audio"):
+            if entry.get("ref_audio") and not args.dry_run:
                 continue  # explicit ref audio, no scoring needed
             texts_to_score.append(entry["text"])
             score_indices.append(i)
@@ -702,17 +708,19 @@ def _write_dry_run_lists(args, per_speaker):
     os.makedirs(args.output_dir, exist_ok=True)
 
     # Collect all entries with their chosen ref_audio, grouped by source file
+    topk = getattr(args, "dry_run_topk", 1) or 1
     by_source = {}  # source_list_path -> list of output lines
     for speaker, data in per_speaker.items():
         ref_manager = data["ref_manager"]
         input_scores = data["input_scores"]
         for i, entry in enumerate(data["entries"]):
-            if entry.get("ref_audio"):
-                ref_audio = entry["ref_audio"]
+            if topk > 1:
+                top_refs = ref_manager.find_topk_references(input_scores[i], k=topk)
+                ref_audio_col = ",".join(r["audio_path"] for r in top_refs)
             else:
                 ref_entry = ref_manager.find_best_reference(input_scores[i])
-                ref_audio = ref_entry["audio_path"]
-            line = f"{entry['audio_path']}|{entry['speaker']}|{entry['language']}|{entry['text']}|{ref_audio}"
+                ref_audio_col = ref_entry["audio_path"]
+            line = f"{entry['audio_path']}|{entry['speaker']}|{entry['language']}|{entry['text']}|{ref_audio_col}"
             source = entry.get("_source_list", "unknown")
             by_source.setdefault(source, []).append(line)
 
