@@ -2,11 +2,11 @@
 Batch inference with emotion-based reference audio selection.
 
 Supports two modes:
-  - manual: Use a single reference audio for all lines
-  - auto:   Automatically select the best reference audio per line based on emotion similarity
-
-Multi-speaker: provide --speaker_config YAML to map speakers to their models and ref data.
-The TTS pipeline loads once and swaps weights per speaker, avoiding redundant base model reloads.
+  - auto (default): Multi-speaker. Requires --speaker_config YAML mapping speakers to
+    model weights and ref data. Each input line is routed to the correct speaker, and the
+    best reference audio is selected per line based on emotion similarity. The TTS pipeline
+    loads once and hot-swaps weights per speaker.
+  - manual: Use a single reference audio for all lines.
 
 Uses the modern TTS class from GPT_SoVITS/TTS_infer_pack/TTS.py.
 """
@@ -20,6 +20,7 @@ import time
 import traceback
 from collections import Counter
 
+import ffmpeg
 import numpy as np
 import soundfile as sf
 import torch
@@ -65,7 +66,7 @@ def sanitize_filename(s: str, max_len: int = 50) -> str:
 
 def parse_list_file(path: str, base_dir: str = None):
     """Parse a .list file. Returns list of dicts with keys:
-       audio_path, speaker, language, text, emotion (optional)."""
+       audio_path, speaker, language, text, ref_audio (optional)."""
     entries = []
     with open(path, "r", encoding="utf-8") as f:
         for lineno, line in enumerate(f, 1):
@@ -84,14 +85,16 @@ def parse_list_file(path: str, base_dir: str = None):
                 "speaker": parts[1],
                 "language": parts[2].strip().lower(),
                 "text": parts[3],
-                "emotion": parts[4].strip() if len(parts) > 4 and parts[4].strip() else None,
+                "ref_audio": parts[4].strip() if len(parts) > 4 and parts[4].strip() else None,
             }
             entries.append(entry)
     return entries
 
 
 def get_audio_duration(path: str) -> float:
-    """Get audio duration in seconds."""
+    """Get audio duration in seconds. Raises if the file cannot be read."""
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"Audio file not found: {path}")
     try:
         info = sf.info(path)
         return info.duration
@@ -101,7 +104,8 @@ def get_audio_duration(path: str) -> float:
         import librosa
         return librosa.get_duration(path=path)
     except Exception:
-        return 0.0
+        raise OSError(f"Could not read audio duration for: {path}  "
+                      "(file exists but neither soundfile nor librosa could read it)")
 
 
 def load_speaker_config(path: str) -> dict:
@@ -207,13 +211,22 @@ class ReferenceDatasetManager:
     def _filter_by_duration(self):
         """Filter raw entries by audio duration. Expensive (reads every file)."""
         filtered = []
+        errors = []
         for entry in self._raw_entries:
-            dur = get_audio_duration(entry["audio_path"])
+            try:
+                dur = get_audio_duration(entry["audio_path"])
+            except (FileNotFoundError, OSError) as e:
+                errors.append(str(e))
+                continue
             if self.min_duration <= dur <= self.max_duration:
                 entry["duration"] = dur
                 filtered.append(entry)
             else:
                 print(f"[RefManager] Skipping {entry['audio_path']} (duration={dur:.1f}s, need {self.min_duration}-{self.max_duration}s)")
+        if errors:
+            print(f"[ERROR] {len(errors)} reference audio(s) could not be read:")
+            for err in errors:
+                print(f"  - {err}")
         self.ref_entries = filtered
         if not self.ref_entries:
             raise ValueError("No reference audios passed the duration filter!")
@@ -281,6 +294,14 @@ class ReferenceDatasetManager:
         except Exception as e:
             print(f"[WARN] Failed to save cache: {e}")
 
+    def find_entry_by_audio(self, audio_path: str):
+        """Look up a ref entry by audio path (exact or basename match)."""
+        basename = os.path.basename(audio_path)
+        for entry in self.ref_entries:
+            if entry["audio_path"] == audio_path or os.path.basename(entry["audio_path"]) == basename:
+                return entry
+        return None
+
     def find_best_reference(self, input_scores: np.ndarray) -> dict:
         """Find the ref with highest cosine similarity to input_scores."""
         if self.score_vectors is None:
@@ -305,42 +326,33 @@ def build_parser() -> argparse.ArgumentParser:
         description="Batch TTS inference with emotion-based reference audio selection",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Multi-speaker mode (--speaker_config):
-  Provide a YAML file mapping speakers to model paths and ref data.
-  Input list speaker column routes each line to the correct model.
-  The TTS pipeline loads once and swaps weights per speaker.
-
-  Example speaker_config.yaml:
-    speakers:
-      alisa:
-        gpt_path: GPT_weights_v2ProPlus/alisa-e15.ckpt
-        sovits_path: SoVITS_weights_v2ProPlus/alisa_e8_s456.pth
-        ref_list: inputs/alisa.list
-        ref_audio_dir: inputs/
-      hiro:
-        gpt_path: GPT_weights_v2ProPlus/hiro-e15.ckpt
-        sovits_path: SoVITS_weights_v2ProPlus/hiro_e8_s2184.pth
-        ref_list: inputs/hiro.list
-        ref_audio_dir: inputs/
+Example speaker_config.yaml:
+  speakers:
+    alisa:
+      gpt_path: GPT_weights_v2ProPlus/alisa-e15.ckpt
+      sovits_path: SoVITS_weights_v2ProPlus/alisa_e8_s456.pth
+      ref_list: inputs/alisa.list
+      ref_audio_dir: inputs/
+    hiro:
+      gpt_path: GPT_weights_v2ProPlus/hiro-e15.ckpt
+      sovits_path: SoVITS_weights_v2ProPlus/hiro_e8_s2184.pth
+      ref_list: inputs/hiro.list
+      ref_audio_dir: inputs/
 """,
     )
 
     # Required
     parser.add_argument("--input_list", required=True, nargs="+",
-                        help="Input .list file(s) (vocal_path|speaker|lang|text[|emotion])")
+                        help="Input .list file(s) (vocal_path|speaker|lang|text[|ref_audio])")
     parser.add_argument("--output_dir", required=True, help="Output directory for synthesized WAVs")
 
     # Mode
     parser.add_argument("--mode", choices=["auto", "manual"], default="auto",
-                        help="auto: select ref by emotion; manual: single ref (default: auto)")
+                        help="auto: multi-speaker emotion-based ref selection; manual: single ref (default: auto)")
 
-    # Multi-speaker config
+    # Auto mode (multi-speaker)
     parser.add_argument("--speaker_config", default=None,
-                        help="YAML file mapping speakers to model paths and ref data (multi-speaker mode)")
-
-    # Single-speaker auto mode
-    parser.add_argument("--ref_list", help="Reference dataset .list file (for auto mode, single speaker)")
-    parser.add_argument("--ref_audio_dir", default=None, help="Base directory for relative ref audio paths")
+                        help="YAML file mapping speakers to model paths and ref data (required for auto mode)")
     parser.add_argument("--emotion_model", default=None,
                         help="Override the default emotion model for the detected language")
 
@@ -348,6 +360,10 @@ Multi-speaker mode (--speaker_config):
     parser.add_argument("--ref_audio_path", help="Reference audio path (for manual mode)")
     parser.add_argument("--ref_text", default="", help="Reference audio transcript")
     parser.add_argument("--ref_lang", default="ja", help="Reference audio language")
+
+    # Dry run — score emotions and pick refs, then write updated list file and exit
+    parser.add_argument("--dry_run", action="store_true",
+                        help="Skip inference; write updated .list with chosen ref_audio in 5th column")
 
     # TTS config
     parser.add_argument("--tts_config", default="GPT_SoVITS/configs/tts_infer.yaml", help="TTS config YAML")
@@ -380,19 +396,25 @@ Multi-speaker mode (--speaker_config):
 # ───────────────────── Synthesis helpers ─────────────────────
 
 def synthesize_entries(tts, entries, ref_manager, input_scores, input_emotions,
-                       args, mode, global_offset=0):
+                       args, mode="auto", global_offset=0):
     """Synthesize a batch of entries. Returns (succeeded, failed) counts."""
     failed = 0
     for i, entry in enumerate(tqdm(entries, desc="Synthesizing")):
         text = entry["text"]
         text_lang = entry["language"]
-        emotion = input_emotions[i] if input_emotions[i] else "neutral"
+        emotion = input_emotions[i] if (input_emotions and input_emotions[i]) else ""
 
         # Determine reference audio
         if mode == "manual":
             ref_audio = args.ref_audio_path
             ref_text = args.ref_text
             ref_lang = args.ref_lang.lower()
+        elif entry.get("ref_audio"):
+            # Explicit ref audio override from input list 5th column
+            ref_audio = entry["ref_audio"]
+            ref_entry = ref_manager.find_entry_by_audio(ref_audio) if ref_manager else None
+            ref_text = ref_entry["text"] if ref_entry else ""
+            ref_lang = ref_entry["language"] if ref_entry else entry["language"]
         else:
             ref_entry = ref_manager.find_best_reference(input_scores[i])
             ref_audio = ref_entry["audio_path"]
@@ -401,7 +423,8 @@ def synthesize_entries(tts, entries, ref_manager, input_scores, input_emotions,
 
         text_preview = text[:40] + "..." if len(text) > 40 else text
         global_i = global_offset + i
-        print(f"\n[{global_i+1}] emotion={emotion} | ref={os.path.basename(ref_audio)} | {text_preview}")
+        emo_tag = f" emotion={emotion} |" if emotion else ""
+        print(f"\n[{global_i+1}]{emo_tag} ref={os.path.basename(ref_audio)} | {text_preview}")
 
         try:
             inputs_dict = {
@@ -425,21 +448,6 @@ def synthesize_entries(tts, entries, ref_manager, input_scores, input_emotions,
             # TTS.run() is a generator
             sr, audio_data = next(tts.run(inputs_dict))
 
-            # Resample if requested
-            if args.output_sr and args.output_sr != sr:
-                import librosa
-                audio_data = librosa.resample(
-                    audio_data.astype(np.float32), orig_sr=sr, target_sr=args.output_sr)
-                sr = args.output_sr
-
-            # Channel conversion if requested
-            if args.output_channels:
-                is_mono = audio_data.ndim == 1
-                if args.output_channels == 2 and is_mono:
-                    audio_data = np.stack([audio_data, audio_data], axis=-1)
-                elif args.output_channels == 1 and not is_mono:
-                    audio_data = audio_data.mean(axis=-1)
-
             # Save output — use first column as output path
             out_path = entry["audio_path"]
             if not os.path.isabs(out_path):
@@ -449,7 +457,29 @@ def synthesize_entries(tts, entries, ref_manager, input_scores, input_emotions,
             if ext.lower() != ".wav":
                 out_path = base + ".wav"
             os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-            sf.write(out_path, audio_data, sr)
+
+            # Resample / channel conversion via ffmpeg if needed
+            need_ffmpeg = ((args.output_sr and args.output_sr != sr)
+                           or args.output_channels)
+            if need_ffmpeg:
+                raw_audio = audio_data.astype(np.int16).tobytes()
+                is_mono = audio_data.ndim == 1
+                input_ac = 1 if is_mono else audio_data.shape[-1]
+                stream = ffmpeg.input(
+                    "pipe:", format="s16le", acodec="pcm_s16le",
+                    ar=str(sr), ac=input_ac)
+                out_kwargs = {}
+                if args.output_sr:
+                    out_kwargs["ar"] = str(args.output_sr)
+                if args.output_channels:
+                    out_kwargs["ac"] = str(args.output_channels)
+                out_bytes, _ = (
+                    stream.output(out_path, **out_kwargs)
+                    .overwrite_output()
+                    .run(input=raw_audio, capture_stdout=True, capture_stderr=True)
+                )
+            else:
+                sf.write(out_path, audio_data, sr)
 
         except Exception as e:
             print(f"[ERROR] Failed on line {global_i+1}: {type(e).__name__}: {e}")
@@ -482,14 +512,10 @@ def main():
     args = parser.parse_args()
 
     # Validate args
-    if args.speaker_config:
-        if args.mode == "manual":
-            parser.error("--speaker_config is only supported in auto mode")
-    else:
-        if args.mode == "auto" and not args.ref_list:
-            parser.error("--ref_list is required for auto mode (or use --speaker_config)")
-        if args.mode == "manual" and not args.ref_audio_path:
-            parser.error("--ref_audio_path is required for manual mode")
+    if args.mode == "auto" and not args.speaker_config:
+        parser.error("--speaker_config is required for auto mode")
+    if args.mode == "manual" and not args.ref_audio_path:
+        parser.error("--ref_audio_path is required for manual mode")
 
     os.makedirs(args.output_dir, exist_ok=True)
 
@@ -500,119 +526,38 @@ def main():
             print(f"[ERROR] Reference audio duration is {dur:.1f}s, must be 3-10s.")
             return
 
-    # Parse all input lists
+    # Parse all input lists (expand globs for Windows cmd.exe compatibility)
+    import glob as _glob
+    expanded_lists = []
+    for pattern in args.input_list:
+        matched = sorted(_glob.glob(pattern))
+        if matched:
+            expanded_lists.extend(matched)
+        else:
+            print(f"[ERROR] No files matched: {pattern}")
+            return
+    if not expanded_lists:
+        print("[ERROR] No input list files found!")
+        return
     input_entries = []
-    for list_path in args.input_list:
+    for list_path in expanded_lists:
         entries = parse_list_file(list_path)
+        for entry in entries:
+            entry["_source_list"] = list_path
         input_entries.extend(entries)
     if not input_entries:
         print("[ERROR] No valid entries in input list(s)!")
         return
     print(f"[INFO] {len(input_entries)} lines to synthesize.")
 
-    # ──────── Route: multi-speaker vs single-speaker ────────
-    if args.speaker_config:
-        _run_multi_speaker(args, input_entries)
-    else:
-        _run_single_speaker(args, input_entries)
+    # ──────── Route: manual vs auto ────────
+    if args.mode == "manual":
+        _run_manual(args, input_entries)
+        return
 
-
-def _run_single_speaker(args, input_entries):
-    """Original single-speaker flow."""
-    ref_manager = None
-    input_scores = [None] * len(input_entries)
-    input_emotions = [None] * len(input_entries)
-
-    if args.mode == "auto":
-        # Parse reference list
-        ref_entries = parse_list_file(args.ref_list, base_dir=args.ref_audio_dir)
-        if not ref_entries:
-            print("[ERROR] No valid entries in reference list!")
-            return
-
-        cache_path = args.ref_list + ".emotion_cache.npz"
-
-        # Determine language (strip "all_" prefix if present)
-        lang = input_entries[0]["language"]
-        emotion_lang = lang.replace("all_", "").replace("auto", "")
-
-        # Load emotion analyzer for this language
-        analyzer = TextEmotionAnalyzer(lang=emotion_lang, model_override=args.emotion_model)
-
-        # Score ref texts
-        ref_manager = ReferenceDatasetManager(
-            ref_entries, cache_path=cache_path, list_file_path=args.ref_list)
-        ref_manager.extract_emotions(analyzer)
-
-        # Score input texts
-        texts_to_score = []
-        score_indices = []
-        for i, entry in enumerate(input_entries):
-            if entry.get("emotion") and entry["emotion"] in analyzer.labels:
-                vec = np.zeros(len(analyzer.labels), dtype=np.float32)
-                vec[analyzer.labels.index(entry["emotion"])] = 1.0
-                input_scores[i] = vec
-            else:
-                texts_to_score.append(entry["text"])
-                score_indices.append(i)
-
-        if texts_to_score:
-            print(f"[INFO] Scoring emotions for {len(texts_to_score)} input texts...")
-            batch_scores = analyzer.get_scores_batch(texts_to_score)
-            for idx, scores in zip(score_indices, batch_scores):
-                input_scores[idx] = scores
-
-        # Print distributions
-        for i, scores in enumerate(input_scores):
-            input_emotions[i] = analyzer.labels[int(np.argmax(scores))]
-
-        print("[INFO] Input emotion distribution:")
-        for emo, count in Counter(input_emotions).most_common():
-            print(f"  {emo}: {count}")
-
-        print("[INFO] Reference emotion distribution:")
-        ref_dominant = [analyzer.labels[int(np.argmax(v))]
-                        for v in ref_manager.score_vectors]
-        for emo, count in Counter(ref_dominant).most_common():
-            print(f"  {emo}: {count}")
-
-        analyzer.unload()
-
-    # Initialize TTS pipeline
-    print("[INFO] Loading TTS pipeline...")
-    from TTS_infer_pack.TTS import TTS, TTS_Config
-
-    tts_config = TTS_Config(args.tts_config)
-    if args.version:
-        tts_config.version = args.version
-    if args.gpt_path:
-        tts_config.t2s_weights_path = args.gpt_path
-    if args.sovits_path:
-        tts_config.vits_weights_path = args.sovits_path
-
-    tts = TTS(tts_config)
-    print("[INFO] TTS pipeline ready.")
-
-    # Synthesize
-    start_time = time.time()
-    ok, failed = synthesize_entries(
-        tts, input_entries, ref_manager, input_scores, input_emotions,
-        args, args.mode,
-    )
-
-    elapsed = time.time() - start_time
-    total = len(input_entries)
-    print(f"\n{'='*60}")
-    print(f"Done! {ok}/{total} succeeded, {failed} failed.")
-    print(f"Time elapsed: {elapsed:.1f}s ({elapsed/max(total,1):.1f}s per line)")
-    print(f"Output directory: {args.output_dir}")
-
-
-def _run_multi_speaker(args, input_entries):
-    """Multi-speaker flow: group by speaker, swap weights per group."""
+    # Load speaker config and group entries by speaker
     speaker_configs = load_speaker_config(args.speaker_config)
 
-    # Group input entries by speaker
     speaker_groups = {}
     unknown_speakers = set()
     for entry in input_entries:
@@ -658,19 +603,16 @@ def _run_multi_speaker(args, input_entries):
             ref_entries, cache_path=cache_path, list_file_path=ref_list)
         ref_manager.extract_emotions(analyzer)
 
-        # Score input texts
+        # Score input texts (skip entries with explicit ref_audio override)
         input_scores = [None] * len(entries)
         input_emotions = [None] * len(entries)
         texts_to_score = []
         score_indices = []
         for i, entry in enumerate(entries):
-            if entry.get("emotion") and entry["emotion"] in analyzer.labels:
-                vec = np.zeros(len(analyzer.labels), dtype=np.float32)
-                vec[analyzer.labels.index(entry["emotion"])] = 1.0
-                input_scores[i] = vec
-            else:
-                texts_to_score.append(entry["text"])
-                score_indices.append(i)
+            if entry.get("ref_audio"):
+                continue  # explicit ref audio, no scoring needed
+            texts_to_score.append(entry["text"])
+            score_indices.append(i)
 
         if texts_to_score:
             batch_scores = analyzer.get_scores_batch(texts_to_score)
@@ -678,7 +620,8 @@ def _run_multi_speaker(args, input_entries):
                 input_scores[idx] = scores
 
         for i, scores in enumerate(input_scores):
-            input_emotions[i] = analyzer.labels[int(np.argmax(scores))]
+            if scores is not None:
+                input_emotions[i] = analyzer.labels[int(np.argmax(scores))]
 
         print(f"  Emotion distribution: {dict(Counter(input_emotions).most_common())}")
 
@@ -691,6 +634,11 @@ def _run_multi_speaker(args, input_entries):
 
     # Free emotion analyzer
     analyzer.unload()
+
+    # Dry run: write updated list files with chosen ref_audio and exit
+    if args.dry_run:
+        _write_dry_run_lists(args, per_speaker)
+        return
 
     # Initialize TTS pipeline once (with first speaker's weights)
     print(f"\n[INFO] Loading TTS pipeline...")
@@ -734,7 +682,7 @@ def _run_multi_speaker(args, input_entries):
         ok, failed = synthesize_entries(
             tts, data["entries"], data["ref_manager"],
             data["input_scores"], data["input_emotions"],
-            args, "auto", global_offset=global_offset,
+            args, global_offset=global_offset,
         )
         total_ok += ok
         total_failed += failed
@@ -745,6 +693,70 @@ def _run_multi_speaker(args, input_entries):
     print(f"\n{'='*60}")
     print(f"All done! {total_ok}/{total_ok+total_failed} succeeded, {total_failed} failed.")
     print(f"Time elapsed: {elapsed:.1f}s ({elapsed/max(total_ok+total_failed,1):.1f}s per line)")
+    print(f"Output directory: {args.output_dir}")
+
+
+def _write_dry_run_lists(args, per_speaker):
+    """Write updated .list files with chosen ref_audio in the 5th column.
+    One output file per original input list, placed in output_dir."""
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    # Collect all entries with their chosen ref_audio, grouped by source file
+    by_source = {}  # source_list_path -> list of output lines
+    for speaker, data in per_speaker.items():
+        ref_manager = data["ref_manager"]
+        input_scores = data["input_scores"]
+        for i, entry in enumerate(data["entries"]):
+            if entry.get("ref_audio"):
+                ref_audio = entry["ref_audio"]
+            else:
+                ref_entry = ref_manager.find_best_reference(input_scores[i])
+                ref_audio = ref_entry["audio_path"]
+            line = f"{entry['audio_path']}|{entry['speaker']}|{entry['language']}|{entry['text']}|{ref_audio}"
+            source = entry.get("_source_list", "unknown")
+            by_source.setdefault(source, []).append(line)
+
+    total = 0
+    for source_path, lines in by_source.items():
+        out_name = os.path.basename(source_path)
+        out_path = os.path.join(args.output_dir, out_name)
+        with open(out_path, "w", encoding="utf-8") as f:
+            for line in lines:
+                f.write(line + "\n")
+        total += len(lines)
+        print(f"[INFO] Wrote {len(lines)} lines to {out_path}")
+    print(f"[INFO] Dry run complete. {total} lines across {len(by_source)} file(s).")
+
+
+def _run_manual(args, input_entries):
+    """Manual mode: single reference audio for all lines."""
+    print("[INFO] Loading TTS pipeline...")
+    from TTS_infer_pack.TTS import TTS, TTS_Config
+
+    tts_config = TTS_Config(args.tts_config)
+    if args.version:
+        tts_config.version = args.version
+    if args.gpt_path:
+        tts_config.t2s_weights_path = args.gpt_path
+    if args.sovits_path:
+        tts_config.vits_weights_path = args.sovits_path
+
+    tts = TTS(tts_config)
+    print("[INFO] TTS pipeline ready.")
+
+    input_emotions = [None] * len(input_entries)
+
+    start_time = time.time()
+    ok, failed = synthesize_entries(
+        tts, input_entries, None, None, input_emotions,
+        args, mode="manual",
+    )
+
+    elapsed = time.time() - start_time
+    total = len(input_entries)
+    print(f"\n{'='*60}")
+    print(f"Done! {ok}/{total} succeeded, {failed} failed.")
+    print(f"Time elapsed: {elapsed:.1f}s ({elapsed/max(total,1):.1f}s per line)")
     print(f"Output directory: {args.output_dir}")
 
 
