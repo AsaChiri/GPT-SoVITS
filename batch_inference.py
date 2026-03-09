@@ -71,7 +71,7 @@ def parse_list_file(path: str, base_dir: str = None):
     with open(path, "r", encoding="utf-8") as f:
         for lineno, line in enumerate(f, 1):
             line = line.strip()
-            if not line:
+            if not line or line.startswith("#"):
                 continue
             parts = line.split("|")
             if len(parts) < 4:
